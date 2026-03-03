@@ -1,0 +1,4 @@
+#!/bin/sh
+# Minimal stub: gibt STUB_JF_VAL für alle Queries zurück
+echo "${STUB_JF_VAL:-}"
+exit 0

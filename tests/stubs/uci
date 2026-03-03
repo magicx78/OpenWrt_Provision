@@ -1,0 +1,8 @@
+#!/bin/sh
+case "$*" in
+    "show wireless"*) echo "wireless.radio0=wifi-device"; echo "wireless.radio0.band=5g";;
+    "-q get wireless.radio0.band") echo "5g";;
+    "-q get wireless.radio1.band") echo "2g";;
+    *) true;;
+esac
+exit 0

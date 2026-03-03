@@ -1,0 +1,6 @@
+#!/bin/sh
+[ "$1" = "list-installed" ] && {
+    echo "${STUB_OPKG_OUTPUT:-wpad-openssl - 2024}"
+    exit 0
+}
+exit 0
