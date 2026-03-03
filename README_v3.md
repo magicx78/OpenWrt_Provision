@@ -268,3 +268,42 @@ Nach Rollback: Log analysieren, Konfiguration in master.json korrigieren.
 - `master.json` enthält Passwörter im Klartext → Dateiberechtigungen setzen: `chmod 600 /etc/provision/master.json`
 - Der Token im Bootstrap-Script (`provisioning.sh`) sollte rotiert werden
 - Für produktive Deployments: r0kh/r1kh Keys individuell pro Deployment wählen, nicht Default-Werte aus master.json
+
+---
+
+## Production Readiness
+
+**Status: STABLE — v3.0.0**
+
+Alle Gate-Bedingungen G1–G14 erfüllt auf echter Hardware (OpenWrt 22.03+, DSA).
+
+### Verifizierte Sicherheitsmechanismen
+
+| Test | Kommando | Erwartetes RC | Ergebnis |
+|------|----------|---------------|---------|
+| TX01 | `--validate-only` + `--dry-run` | 0 | PASS |
+| TX02a | Backup Hard Gate (chmod 555) | 20 | PASS |
+| TX02b | Backup-Checksums nach Apply | 0 | PASS |
+| TX03a | DFS-Kanal ohne `--allow-dfs` | 10 | PASS |
+| TX04 | 802.11r-Validierung (leer r0kh) | 10 | PASS |
+| TX05a | Erster sauberer Apply | 0 | PASS |
+| TX05b | Logger-Injektion → Auto-Rollback | 30 | PASS |
+
+Config-Diff nach Rollback: **identisch** (Idempotenz bestätigt).
+
+### Bekannte Einschränkungen
+
+- `tail -n "+N"` wird intern durch `sed -n "N,\$p"` ersetzt (BusyBox-Portabilität)
+- DFS-Kanäle (52–144 GHz) erfordern explizites `--allow-dfs`
+- 802.11r benötigt vollständige `r0kh`/`r1kh`-Listen in `master.json`
+- Apply über SSH: immer in `screen`/`tmux` ausführen — `network reload` trennt die SSH-Verbindung
+
+### Automatisierte Tests
+
+```sh
+# Offline-Tests (kein Router erforderlich):
+ash tests/run.sh
+# Erwartete Ausgabe: 8 PASS / 0 FAIL
+```
+
+8 Tests, 10 Assertions (BusyBox/ash, GNU-frei).
