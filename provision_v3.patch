@@ -1,0 +1,51 @@
+--- a/provision_v3
++++ b/provision_v3
+@@ -235,8 +235,8 @@
+     addr1="${cidr1%%/*}"; pfx1="${cidr1##*/}"
+     addr2="${cidr2%%/*}"; pfx2="${cidr2##*/}"
+ 
+-    # Validierung
+-    [ -z "${pfx1}" ] || [ -z "${pfx2}" ] && return 1
++    # Validierung (explizites if, kein Operator-Prioritätsfehler)
++    if [ -z "${pfx1}" ] || [ -z "${pfx2}" ]; then return 1; fi
+ 
+     # Kleineres Präfix bestimmt den Vergleichsbereich
+     local check_pfx
+@@ -401,7 +401,7 @@
+     _selftest_check "wifi"       "command -v wifi"
+     _selftest_warn  "jshn"       "command -v jshn"
+     _selftest_warn  "bridge"     "command -v bridge"
+-    _selftest_warn  "opkg"       "command -v opkg"
++    _selftest_check "opkg"       "command -v opkg"
+ 
+     echo "--- Pakete ---"
+     local found_wpad=0
+@@ -449,6 +449,11 @@
+ # B01/B02: wpad-basic Konflikt = Hard Fail
+ validate_packages() {
+     log_step "Paket-Validierung (wpad)"
++    if ! command -v opkg >/dev/null 2>&1; then
++        log_fail "opkg nicht gefunden - Paket-Validierung nicht möglich!"
++        log_fail "Ist dies ein OpenWrt-System mit opkg?"
++        return 1
++    fi
+     local found=0
+     for pkg in wpad-openssl wpad-full; do
+         if opkg list-installed 2>/dev/null | grep -q "^${pkg} "; then
+@@ -1168,6 +1173,7 @@
+     local lan_ip; lan_ip="$(echo "${lan_addr}" | sed 's/\.[0-9]*$/\.1/')"
+     local lan_mask; lan_mask="$(prefix_to_mask "${lan_pfx}")"
+ 
++    uci_batch_add "set network.lan=interface"
+     uci_batch_add "set network.lan.device='br-lan.${CFG_VLAN_LAN}'"
+     uci_batch_add "set network.lan.proto='static'"
+     uci_batch_add "set network.lan.ipaddr='${lan_ip}'"
+@@ -1383,7 +1389,7 @@
+ 
+     # Neue Zeilen seit Apply auslesen
+     errors="$(logread 2>/dev/null | \
+-        tail -n "+$((skip + 1))" | \
++        sed -n "$((skip + 1)),\$p" | \
+         grep -iE '(hostapd|netifd|wpa_supplicant).*(FAILED|fatal|cannot bind|refused|invalid config|bad key)' | \
+         head -20)"
+ 
