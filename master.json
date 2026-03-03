@@ -1,0 +1,154 @@
+{
+"regdomain": "DE",
+"country": "DE",
+
+"radios": {
+  "radio5g": {
+    "band": "5g",
+    "channel": "36",
+    "htmode": "VHT80",
+    "txpower": "20",
+    "disabled": "0",
+    "beacon_int": "100",
+    "mu_beamformer": "1"
+  },
+  "radio2g": {
+    "band": "2g",
+    "channel": "6",
+    "htmode": "HT20",
+    "txpower": "20",
+    "disabled": "0",
+    "beacon_int": "100"
+  }
+},
+
+"ssids": {
+  "main":  "HomeNetwork",
+  "guest": "HomeGuest",
+  "mesh":  "mesh_backhaul_11s"
+},
+
+"passphrases": {
+  "main":  "ChangeMe-MainPass-2024!",
+  "guest": "ChangeMe-GuestPass-2024!",
+  "mesh":  "ChangeMe-MeshSecret-2024!"
+},
+
+"encryption_policy": "sae",
+
+"roaming": {
+  "mobility_domain": "ab12",
+  "ft_over_ds": "1",
+  "pmk_r1_push": "1",
+  "reassociation_deadline": "1000",
+  "r0kh": [
+    {"nas_id": "router-01", "ip": "10.0.10.1", "key": "r0kh_shared_key_changeme_2024"},
+    {"nas_id": "router-02", "ip": "10.0.10.2", "key": "r0kh_shared_key_changeme_2024"},
+    {"nas_id": "router-03", "ip": "10.0.10.3", "key": "r0kh_shared_key_changeme_2024"},
+    {"nas_id": "router-10", "ip": "10.0.10.10", "key": "r0kh_shared_key_changeme_2024"}
+  ],
+  "r1kh": [
+    {"r1kh_id": "AA:BB:CC:DD:EE:01", "addr": "10.0.10.1", "key": "r1kh_shared_key_changeme_2024"},
+    {"r1kh_id": "AA:BB:CC:DD:EE:02", "addr": "10.0.10.2", "key": "r1kh_shared_key_changeme_2024"},
+    {"r1kh_id": "AA:BB:CC:DD:EE:03", "addr": "10.0.10.3", "key": "r1kh_shared_key_changeme_2024"},
+    {"r1kh_id": "AA:BB:CC:DD:EE:0A", "addr": "10.0.10.10", "key": "r1kh_shared_key_changeme_2024"}
+  ]
+},
+
+"vlans": {
+  "mgmt":  "10",
+  "lan":   "20",
+  "guest": "30"
+},
+
+"ip_plan": {
+  "mgmt_subnet":   "10.0.10.0/24",
+  "lan_subnet":    "192.168.20.0/24",
+  "guest_subnet":  "192.168.30.0/24",
+  "dns_primary":   "1.1.1.1",
+  "dns_secondary": "8.8.8.8"
+},
+
+"nodes": [
+  {
+    "id": "01",
+    "hostname": "router-01",
+    "mgmt_ip":  "10.0.10.1",
+    "role":     "ap_roaming",
+    "master_ap_ip": "",
+    "master_ap_bssid": "AA:BB:CC:DD:EE:01"
+  },
+  {
+    "id": "02",
+    "hostname": "router-02",
+    "mgmt_ip":  "10.0.10.2",
+    "role":     "ap_roaming",
+    "master_ap_ip": "",
+    "master_ap_bssid": "AA:BB:CC:DD:EE:02"
+  },
+  {
+    "id": "03",
+    "hostname": "router-03",
+    "mgmt_ip":  "10.0.10.3",
+    "role":     "ap_roaming",
+    "master_ap_ip": "",
+    "master_ap_bssid": "AA:BB:CC:DD:EE:03"
+  },
+  {
+    "id": "04",
+    "hostname": "router-04",
+    "mgmt_ip":  "10.0.10.4",
+    "role":     "mesh_11s_backhaul",
+    "master_ap_ip": "",
+    "master_ap_bssid": ""
+  },
+  {
+    "id": "05",
+    "hostname": "router-05",
+    "mgmt_ip":  "10.0.10.5",
+    "role":     "mesh_11s_backhaul",
+    "master_ap_ip": "",
+    "master_ap_bssid": ""
+  },
+  {
+    "id": "06",
+    "hostname": "router-06",
+    "mgmt_ip":  "10.0.10.6",
+    "role":     "client_backhaul",
+    "master_ap_ip": "10.0.10.1",
+    "master_ap_bssid": "AA:BB:CC:DD:EE:01"
+  },
+  {
+    "id": "07",
+    "hostname": "router-07",
+    "mgmt_ip":  "10.0.10.7",
+    "role":     "client_backhaul",
+    "master_ap_ip": "10.0.10.2",
+    "master_ap_bssid": "AA:BB:CC:DD:EE:02"
+  },
+  {
+    "id": "08",
+    "hostname": "router-08",
+    "mgmt_ip":  "10.0.10.8",
+    "role":     "guest_isolated",
+    "master_ap_ip": "",
+    "master_ap_bssid": ""
+  },
+  {
+    "id": "09",
+    "hostname": "router-09",
+    "mgmt_ip":  "10.0.10.9",
+    "role":     "guest_isolated",
+    "master_ap_ip": "",
+    "master_ap_bssid": ""
+  },
+  {
+    "id": "10",
+    "hostname": "router-10",
+    "mgmt_ip":  "10.0.10.10",
+    "role":     "ap_roaming",
+    "master_ap_ip": "",
+    "master_ap_bssid": "AA:BB:CC:DD:EE:0A"
+  }
+]
+}

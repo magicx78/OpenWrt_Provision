@@ -1,0 +1,1206 @@
+#!/bin/ash
+# =============================================================================
+# provision - OpenWrt Router Provisioning System
+# Version: 2.0.0
+# Compatible: OpenWrt 22.03+ / ash / DSA / WPA3+SAE / 802.11r
+# =============================================================================
+
+# =============================================================================
+# CONFIG BLOCK - alle Defaults hier anpassen
+# =============================================================================
+PROVISION_DIR="/etc/provision"
+MASTER_JSON="${PROVISION_DIR}/master.json"
+BACKUP_BASE="${PROVISION_DIR}/backups"
+LOG_DIR="${PROVISION_DIR}/logs"
+MAIN_LOG="/var/log/provision.log"
+MANAGED_MARKER="provision_managed"
+UCI_BATCH_FILE="/tmp/provision_uci_batch.$$"
+HEALTHCHECK_TIMEOUT=30
+HEALTHCHECK_SLEEP=5
+LOGREAD_WINDOW=60   # Sekunden rückblickend nach Apply
+MIN_WPAD="wpad-openssl wpad-full"
+# Arbeitsannahme: MESH_PROTO=none = reines 802.11s-Bridging (kein batman-adv).
+# Auf 'batadv' setzen wenn kmod-batman-adv installiert ist.
+MESH_PROTO="none"
+VERSION="2.0.0"
+
+# =============================================================================
+# EXIT CODES
+# =============================================================================
+EXIT_OK=0
+EXIT_VALIDATION=10
+EXIT_APPLY=20
+EXIT_HEALTHCHECK=30
+EXIT_ROLLBACK=40
+
+# =============================================================================
+# GLOBALS (werden zur Laufzeit gesetzt)
+# =============================================================================
+NODE_ID=""
+PROFILE=""
+DO_APPLY=0
+DRY_RUN=0
+VALIDATE_ONLY=0
+DO_ROLLBACK=0
+VERBOSE=0
+ENABLE_11R=0
+ENABLE_11K=0
+ENABLE_11V=0
+TIMESTAMP=""
+BACKUP_DIR=""
+CHANGES_NETWORK=0
+CHANGES_WIRELESS=0
+CHANGES_FIREWALL=0
+CHANGES_DHCP=0
+APPLY_TIME=0
+
+# =============================================================================
+# LOGGING
+# =============================================================================
+log_init() {
+    TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+    mkdir -p "${LOG_DIR}" 2>/dev/null
+    STEP_LOG="${LOG_DIR}/${TIMESTAMP}.log"
+    touch "${MAIN_LOG}" 2>/dev/null || MAIN_LOG="/tmp/provision.log"
+    touch "${STEP_LOG}" 2>/dev/null || STEP_LOG="/tmp/provision_${TIMESTAMP}.log"
+}
+
+_log() {
+    local level="$1"; shift
+    local msg="$*"
+    local ts; ts="$(date '+%Y-%m-%d %H:%M:%S')"
+    local line="[${ts}] [${level}] node=${NODE_ID:-?} profile=${PROFILE:-?} ${msg}"
+    echo "${line}" >> "${MAIN_LOG}"
+    echo "${line}" >> "${STEP_LOG}"
+    case "${level}" in
+        ERROR|FAIL) echo "  [${level}] ${msg}" >&2 ;;
+        WARN)       echo "  [WARN]  ${msg}" >&2 ;;
+        *)          [ "${VERBOSE}" -eq 1 ] && echo "  [${level}] ${msg}" || true ;;
+    esac
+}
+
+log_info()  { _log "INFO"  "$*"; }
+log_ok()    { _log "OK"    "$*"; }
+log_warn()  { _log "WARN"  "$*"; }
+log_error() { _log "ERROR" "$*"; }
+log_step()  { _log "STEP"  ">>> $*"; echo "==> $*"; }
+log_fail()  { _log "FAIL"  "$*"; echo "  [FAIL] $*" >&2; }
+
+# =============================================================================
+# USAGE
+# =============================================================================
+usage() {
+    cat <<EOF
+provision v${VERSION} - OpenWrt Router Provisioning System
+
+Usage:
+  provision --node-id <id> --profile <profile> [options]
+
+Options:
+  --node-id <id>       Node-ID z.B. 01..10
+  --profile <name>     ap_roaming | mesh_11s_backhaul | client_backhaul | guest_isolated
+  --apply              Konfiguration anwenden
+  --dry-run            Nur UCI-Batch ausgeben, nichts schreiben
+  --validate-only      Nur Validierung, kein Apply
+  --rollback           Letztes Backup wiederherstellen
+  --enable-11r         802.11r Fast BSS Transition aktivieren (ap_roaming)
+  --enable-11k         802.11k Radio Resource Management (ap_roaming)
+  --enable-11v         802.11v BSS Transition Management (ap_roaming)
+  --verbose            Erweiterte Ausgabe
+  --help               Diese Hilfe
+
+Exit-Codes:
+  0   OK
+  10  Validation failed
+  20  Apply failed
+  30  Healthcheck failed
+  40  Rollback failed
+
+Beispiele:
+  provision --node-id 03 --profile ap_roaming --apply --enable-11r --enable-11k
+  provision --node-id 05 --profile guest_isolated --dry-run
+  provision --node-id 01 --profile mesh_11s_backhaul --validate-only
+  provision --node-id 03 --rollback
+EOF
+    exit ${EXIT_OK}
+}
+
+# =============================================================================
+# ARGUMENT PARSING
+# =============================================================================
+parse_args() {
+    [ $# -eq 0 ] && usage
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --node-id)       NODE_ID="$2";   shift 2 ;;
+            --profile)       PROFILE="$2";   shift 2 ;;
+            --apply)         DO_APPLY=1;      shift ;;
+            --dry-run)       DRY_RUN=1;       shift ;;
+            --validate-only) VALIDATE_ONLY=1; shift ;;
+            --rollback)      DO_ROLLBACK=1;   shift ;;
+            --enable-11r)    ENABLE_11R=1;    shift ;;
+            --enable-11k)    ENABLE_11K=1;    shift ;;
+            --enable-11v)    ENABLE_11V=1;    shift ;;
+            --verbose)       VERBOSE=1;       shift ;;
+            --help|-h)       usage ;;
+            *) log_fail "Unbekannter Parameter: $1"; exit ${EXIT_VALIDATION} ;;
+        esac
+    done
+
+    if [ "${DO_ROLLBACK}" -eq 1 ]; then
+        [ -z "${NODE_ID}" ] && { log_fail "--node-id erforderlich für --rollback"; exit ${EXIT_VALIDATION}; }
+        return 0
+    fi
+
+    [ -z "${NODE_ID}" ]  && { log_fail "--node-id ist erforderlich";  exit ${EXIT_VALIDATION}; }
+    [ -z "${PROFILE}" ]  && { log_fail "--profile ist erforderlich";  exit ${EXIT_VALIDATION}; }
+
+    case "${PROFILE}" in
+        ap_roaming|mesh_11s_backhaul|client_backhaul|guest_isolated) ;;
+        *) log_fail "Unbekanntes Profil: ${PROFILE}. Erlaubt: ap_roaming mesh_11s_backhaul client_backhaul guest_isolated"
+           exit ${EXIT_VALIDATION} ;;
+    esac
+
+    if [ "${DO_APPLY}" -eq 0 ] && [ "${DRY_RUN}" -eq 0 ] && [ "${VALIDATE_ONLY}" -eq 0 ]; then
+        log_fail "Modus angeben: --apply, --dry-run oder --validate-only"
+        exit ${EXIT_VALIDATION}
+    fi
+}
+
+# =============================================================================
+# JSON PARSING (jsonfilter / jshn - OpenWrt native)
+# =============================================================================
+jf() {
+    # jsonfilter wrapper: jf <file> <expression>
+    jsonfilter -i "$1" -e "$2" 2>/dev/null
+}
+
+jf_str() {
+    local val; val="$(jf "$1" "$2")"
+    [ -n "${val}" ] && echo "${val}" || echo "${3:-}"
+}
+
+# jshn-basiertes Laden der Master-Config in Shell-Variablen
+load_master_json() {
+    log_step "Lade master.json: ${MASTER_JSON}"
+    [ -f "${MASTER_JSON}" ] || {
+        log_fail "master.json nicht gefunden: ${MASTER_JSON}"
+        exit ${EXIT_VALIDATION}
+    }
+
+    # Globale Felder
+    CFG_REGDOMAIN="$(jf_str "${MASTER_JSON}" '$.regdomain' 'DE')"
+    CFG_COUNTRY="$(jf_str "${MASTER_JSON}" '$.country' 'DE')"
+
+    # Radio 5G
+    CFG_RADIO5G_CHANNEL="$(jf_str "${MASTER_JSON}" '$.radios.radio5g.channel' '36')"
+    CFG_RADIO5G_HTMODE="$(jf_str "${MASTER_JSON}" '$.radios.radio5g.htmode' 'VHT80')"
+    CFG_RADIO5G_TXPOWER="$(jf_str "${MASTER_JSON}" '$.radios.radio5g.txpower' '20')"
+    CFG_RADIO5G_DISABLED="$(jf_str "${MASTER_JSON}" '$.radios.radio5g.disabled' '0')"
+
+    # Radio 2G
+    CFG_RADIO2G_CHANNEL="$(jf_str "${MASTER_JSON}" '$.radios.radio2g.channel' '6')"
+    CFG_RADIO2G_HTMODE="$(jf_str "${MASTER_JSON}" '$.radios.radio2g.htmode' 'HT20')"
+    CFG_RADIO2G_TXPOWER="$(jf_str "${MASTER_JSON}" '$.radios.radio2g.txpower' '20')"
+    CFG_RADIO2G_DISABLED="$(jf_str "${MASTER_JSON}" '$.radios.radio2g.disabled' '0')"
+
+    # SSIDs + Passphrases
+    CFG_SSID_MAIN="$(jf_str "${MASTER_JSON}" '$.ssids.main' 'HomeNetwork')"
+    CFG_SSID_GUEST="$(jf_str "${MASTER_JSON}" '$.ssids.guest' 'HomeGuest')"
+    CFG_SSID_MESH="$(jf_str "${MASTER_JSON}" '$.ssids.mesh' 'mesh_backhaul')"
+
+    CFG_PASS_MAIN="$(jf_str "${MASTER_JSON}" '$.passphrases.main' 'ChangeMe123!')"
+    CFG_PASS_GUEST="$(jf_str "${MASTER_JSON}" '$.passphrases.guest' 'GuestPass123!')"
+    CFG_PASS_MESH="$(jf_str "${MASTER_JSON}" '$.passphrases.mesh' 'MeshSecret123!')"
+
+    # Encryption policy
+    CFG_ENC_POLICY="$(jf_str "${MASTER_JSON}" '$.encryption_policy' 'sae')"
+    CFG_MOBILITY_DOMAIN="$(jf_str "${MASTER_JSON}" '$.roaming.mobility_domain' 'abcd')"
+    CFG_FT_OVER_DS="$(jf_str "${MASTER_JSON}" '$.roaming.ft_over_ds' '1')"
+
+    # VLANs
+    CFG_VLAN_MGMT="$(jf_str "${MASTER_JSON}" '$.vlans.mgmt' '10')"
+    CFG_VLAN_LAN="$(jf_str "${MASTER_JSON}" '$.vlans.lan' '20')"
+    CFG_VLAN_GUEST="$(jf_str "${MASTER_JSON}" '$.vlans.guest' '30')"
+
+    # IP Plan
+    CFG_IP_MGMT_SUBNET="$(jf_str "${MASTER_JSON}" '$.ip_plan.mgmt_subnet' '10.0.10.0/24')"
+    CFG_IP_LAN_SUBNET="$(jf_str "${MASTER_JSON}" '$.ip_plan.lan_subnet' '192.168.1.0/24')"
+    CFG_IP_GUEST_SUBNET="$(jf_str "${MASTER_JSON}" '$.ip_plan.guest_subnet' '192.168.30.0/24')"
+    CFG_DNS_PRIMARY="$(jf_str "${MASTER_JSON}" '$.ip_plan.dns_primary' '1.1.1.1')"
+    CFG_DNS_SECONDARY="$(jf_str "${MASTER_JSON}" '$.ip_plan.dns_secondary' '8.8.8.8')"
+
+    # Node-spezifische Felder
+    local node_path="$.nodes[?(@.id==\"${NODE_ID}\")]"
+    CFG_NODE_HOSTNAME="$(jf_str "${MASTER_JSON}" "${node_path}.hostname" "openwrt-${NODE_ID}")"
+    CFG_NODE_MGMT_IP="$(jf_str "${MASTER_JSON}" "${node_path}.mgmt_ip" "")"
+    CFG_NODE_ROLE="$(jf_str "${MASTER_JSON}" "${node_path}.role" "${PROFILE}")"
+    CFG_NODE_MASTER_AP="$(jf_str "${MASTER_JSON}" "${node_path}.master_ap_ip" "")"
+
+    # Master-AP Info (für client_backhaul)
+    CFG_MASTER_AP_BSSID="$(jf_str "${MASTER_JSON}" "${node_path}.master_ap_bssid" "")"
+
+    log_ok "master.json geladen: node=${NODE_ID} hostname=${CFG_NODE_HOSTNAME} mgmt_ip=${CFG_NODE_MGMT_IP}"
+}
+
+# =============================================================================
+# PRE-VALIDATION
+# =============================================================================
+
+validate_packages() {
+    log_step "Paket-Validierung (wpad)"
+    local found=0
+    for pkg in wpad-openssl wpad-full; do
+        if opkg list-installed 2>/dev/null | grep -q "^${pkg} "; then
+            log_ok "Paket gefunden: ${pkg}"
+            found=1
+            break
+        fi
+    done
+    if [ "${found}" -eq 0 ]; then
+        log_fail "Kein geeignetes wpad-Paket installiert!"
+        log_fail "WPA3/SAE und 802.11r erfordern wpad-openssl oder wpad-full."
+        log_fail "Behebung:"
+        log_fail "  opkg update"
+        log_fail "  opkg remove wpad-basic-wolfssl wpad-basic wpad-mini"
+        log_fail "  opkg install wpad-openssl"
+        return 1
+    fi
+
+    # Prüfe ob wpad-basic (inkompatibel) noch da ist
+    if opkg list-installed 2>/dev/null | grep -qE '^wpad-basic'; then
+        log_warn "wpad-basic noch installiert - Konflikt möglich! Entfernen empfohlen:"
+        log_warn "  opkg remove wpad-basic-wolfssl wpad-basic"
+    fi
+
+    # batman-adv nur prüfen wenn mesh_11s_backhaul + MESH_PROTO=batadv
+    if [ "${PROFILE}" = "mesh_11s_backhaul" ] && [ "${MESH_PROTO}" = "batadv" ]; then
+        if ! opkg list-installed 2>/dev/null | grep -q '^kmod-batman-adv '; then
+            log_fail "MESH_PROTO=batadv aber kmod-batman-adv nicht installiert!"
+            log_fail "Behebung: opkg update && opkg install kmod-batman-adv batctl-full"
+            log_fail "Alternativ: MESH_PROTO=none für reines 802.11s-Bridging (kein batadv nötig)"
+            return 1
+        fi
+        log_ok "kmod-batman-adv: installiert"
+    fi
+    return 0
+}
+
+validate_regdomain() {
+    log_step "Regdomain-Validierung"
+    local current_reg
+    current_reg="$(iw reg get 2>/dev/null | grep '^country' | awk '{print $2}' | tr -d ':')"
+    if [ -z "${current_reg}" ]; then
+        log_warn "Regdomain nicht lesbar (iw reg get fehlgeschlagen)"
+    elif [ "${current_reg}" != "${CFG_REGDOMAIN}" ]; then
+        log_warn "Regdomain-Mismatch: aktuell=${current_reg} erwartet=${CFG_REGDOMAIN}"
+        log_warn "Wird per UCI gesetzt: option country '${CFG_REGDOMAIN}'"
+    else
+        log_ok "Regdomain korrekt: ${current_reg}"
+    fi
+    return 0
+}
+
+validate_channel() {
+    log_step "Channel/HTMode-Validierung via iw list"
+    local iw_out; iw_out="$(iw list 2>/dev/null)"
+    if [ -z "${iw_out}" ]; then
+        log_warn "iw list liefert keine Ausgabe - WLAN-Treiber bereit?"
+        return 0
+    fi
+
+    # DFS-Warnung für 5G
+    case "${CFG_RADIO5G_CHANNEL}" in
+        52|56|60|64|100|104|108|112|116|120|124|128|132|136|140|144)
+            log_warn "5G-Channel ${CFG_RADIO5G_CHANNEL} ist DFS-pflichtig (Radar-Detection erforderlich)."
+            log_warn "Empfehlung: UNII-1 Channels 36/40/44/48 für Mesh/AP nutzen."
+            ;;
+        36|40|44|48)
+            log_ok "5G-Channel ${CFG_RADIO5G_CHANNEL}: UNII-1, kein DFS erforderlich."
+            ;;
+        *)
+            log_warn "5G-Channel ${CFG_RADIO5G_CHANNEL}: bitte manuell prüfen."
+            ;;
+    esac
+
+    # HTMode Plausibilität
+    case "${CFG_RADIO5G_HTMODE}" in
+        VHT20|VHT40|VHT80|VHT80+80|VHT160|HE20|HE40|HE80|HE160) log_ok "5G HTMode: ${CFG_RADIO5G_HTMODE} gültig" ;;
+        *) log_warn "5G HTMode '${CFG_RADIO5G_HTMODE}' unbekannt - bitte prüfen" ;;
+    esac
+    case "${CFG_RADIO2G_HTMODE}" in
+        HT20|HT40|HE20|HE40) log_ok "2G HTMode: ${CFG_RADIO2G_HTMODE} gültig" ;;
+        *) log_warn "2G HTMode '${CFG_RADIO2G_HTMODE}' unbekannt - bitte prüfen" ;;
+    esac
+    return 0
+}
+
+validate_wireless_status() {
+    log_step "WLAN-Status via ubus"
+    local status
+    status="$(ubus call network.wireless status 2>/dev/null)"
+    if [ -z "${status}" ]; then
+        log_warn "ubus call network.wireless status: keine Antwort (WLAN-Subsystem noch nicht bereit)"
+    else
+        log_ok "ubus network.wireless status: OK"
+        [ "${VERBOSE}" -eq 1 ] && echo "${status}" | head -20
+    fi
+    return 0
+}
+
+validate_dsa_bridge() {
+    log_step "DSA/Bridge-Konsistenz-Check"
+    # Bridge br-lan muss existieren
+    if ! ip link show type bridge 2>/dev/null | grep -q 'br-'; then
+        log_warn "Keine Bridge-Interfaces gefunden - DSA korrekt konfiguriert?"
+    else
+        log_ok "Bridge-Interfaces vorhanden"
+    fi
+
+    # VLAN-IDs auf Konsistenz
+    local v_set=""
+    for vlan in "${CFG_VLAN_MGMT}" "${CFG_VLAN_LAN}" "${CFG_VLAN_GUEST}"; do
+        if echo "${v_set}" | grep -q ":${vlan}:"; then
+            log_fail "VLAN-ID ${vlan} doppelt vergeben in master.json!"
+            return 1
+        fi
+        v_set="${v_set}:${vlan}:"
+    done
+    log_ok "VLAN-IDs konsistent: mgmt=${CFG_VLAN_MGMT} lan=${CFG_VLAN_LAN} guest=${CFG_VLAN_GUEST}"
+
+    # Subnetz-Kollisionsprüfung (vereinfacht: erste 3 Oktette)
+    local mgmt_prefix; mgmt_prefix="$(echo "${CFG_IP_MGMT_SUBNET}" | cut -d'.' -f1-3)"
+    local lan_prefix;  lan_prefix="$(echo "${CFG_IP_LAN_SUBNET}"  | cut -d'.' -f1-3)"
+    local guest_prefix; guest_prefix="$(echo "${CFG_IP_GUEST_SUBNET}" | cut -d'.' -f1-3)"
+
+    if [ "${mgmt_prefix}" = "${lan_prefix}" ] || [ "${mgmt_prefix}" = "${guest_prefix}" ] || [ "${lan_prefix}" = "${guest_prefix}" ]; then
+        log_fail "Subnetz-Kollision! mgmt=${CFG_IP_MGMT_SUBNET} lan=${CFG_IP_LAN_SUBNET} guest=${CFG_IP_GUEST_SUBNET}"
+        return 1
+    fi
+    log_ok "Subnetze kollisionsfrei"
+    return 0
+}
+
+validate_node_id() {
+    log_step "Node-ID Validierung"
+    local found; found="$(jf "${MASTER_JSON}" "$.nodes[?(@.id==\"${NODE_ID}\")].id" 2>/dev/null)"
+    if [ -z "${found}" ]; then
+        log_fail "Node-ID '${NODE_ID}' nicht in master.json gefunden!"
+        log_fail "Verfügbare Nodes:"
+        jf "${MASTER_JSON}" '$.nodes[*].id' 2>/dev/null | tr ' ' '\n' | sed 's/^/  - /'
+        return 1
+    fi
+    [ -z "${CFG_NODE_MGMT_IP}" ] && {
+        log_fail "Node ${NODE_ID}: mgmt_ip nicht gesetzt in master.json"
+        return 1
+    }
+    log_ok "Node ${NODE_ID}: hostname=${CFG_NODE_HOSTNAME} mgmt_ip=${CFG_NODE_MGMT_IP}"
+    return 0
+}
+
+run_validations() {
+    local fail=0
+    validate_packages  || fail=1
+    validate_node_id   || fail=1
+    validate_regdomain
+    validate_channel
+    validate_wireless_status
+    validate_dsa_bridge || fail=1
+
+    if [ "${fail}" -ne 0 ]; then
+        log_fail "Validierung fehlgeschlagen - Abbruch"
+        return 1
+    fi
+    log_ok "Alle Validierungen bestanden"
+    return 0
+}
+
+# =============================================================================
+# BACKUP
+# =============================================================================
+create_backup() {
+    log_step "Erstelle Backup"
+    BACKUP_DIR="${BACKUP_BASE}/${TIMESTAMP}_node${NODE_ID}_${PROFILE}"
+    mkdir -p "${BACKUP_DIR}" || {
+        log_fail "Backup-Verzeichnis konnte nicht erstellt werden: ${BACKUP_DIR}"
+        return 1
+    }
+
+    local configs="network wireless firewall dhcp"
+    for cfg in ${configs}; do
+        if [ -f "/etc/config/${cfg}" ]; then
+            cp "/etc/config/${cfg}" "${BACKUP_DIR}/${cfg}" && \
+                log_info "Backup: /etc/config/${cfg} -> ${BACKUP_DIR}/${cfg}" || \
+                log_warn "Backup fehlgeschlagen für: ${cfg}"
+        fi
+    done
+
+    # Metadata
+    cat > "${BACKUP_DIR}/metadata.json" <<EOF
+{
+  "timestamp": "${TIMESTAMP}",
+  "node_id": "${NODE_ID}",
+  "profile": "${PROFILE}",
+  "hostname": "${CFG_NODE_HOSTNAME}",
+  "enable_11r": ${ENABLE_11R},
+  "enable_11k": ${ENABLE_11K},
+  "enable_11v": ${ENABLE_11V},
+  "files": ["network", "wireless", "firewall", "dhcp"]
+}
+EOF
+
+    # SHA256-Checksums
+    for cfg in network wireless firewall dhcp; do
+        [ -f "${BACKUP_DIR}/${cfg}" ] && \
+            sha256sum "${BACKUP_DIR}/${cfg}" >> "${BACKUP_DIR}/checksums.sha256"
+    done
+
+    log_ok "Backup erstellt: ${BACKUP_DIR}"
+    return 0
+}
+
+# =============================================================================
+# UCI BATCH HELPERS
+# =============================================================================
+uci_batch_init() {
+    > "${UCI_BATCH_FILE}"
+}
+
+uci_batch_add() {
+    echo "$*" >> "${UCI_BATCH_FILE}"
+}
+
+# Lösche alle provision_managed Sections einer config
+uci_delete_managed_sections() {
+    local config="$1"
+    # Finde alle sections mit option provision_managed '1'
+    local sections
+    sections="$(uci show "${config}" 2>/dev/null | grep "\.${MANAGED_MARKER}='1'" | cut -d'.' -f1-2)"
+    for sec in ${sections}; do
+        uci_batch_add "delete ${sec}"
+        log_info "Idempotenz: lösche managed section ${sec}"
+    done
+}
+
+# uci_batch_commit() entfernt (war dead code, PIPESTATUS-Bug).
+# apply_config() führt uci batch direkt aus.
+
+# =============================================================================
+# RENDER: System/Hostname
+# =============================================================================
+render_system() {
+    log_step "Render: system"
+    uci_batch_add "set system.@system[0].hostname='${CFG_NODE_HOSTNAME}'"
+    uci_batch_add "set system.@system[0].timezone='CET-1CEST,M3.5.0,M10.5.0/3'"
+    uci_batch_add "set system.@system[0].log_proto='udp'"
+    uci_batch_add "commit system"
+    log_ok "system section gerendert"
+}
+
+# =============================================================================
+# RENDER: Radio
+# =============================================================================
+render_radios() {
+    log_step "Render: wireless radios"
+    uci_batch_add "set wireless.radio0.country='${CFG_REGDOMAIN}'"
+    uci_batch_add "set wireless.radio0.channel='${CFG_RADIO5G_CHANNEL}'"
+    uci_batch_add "set wireless.radio0.htmode='${CFG_RADIO5G_HTMODE}'"
+    uci_batch_add "set wireless.radio0.txpower='${CFG_RADIO5G_TXPOWER}'"
+    uci_batch_add "set wireless.radio0.disabled='${CFG_RADIO5G_DISABLED}'"
+    uci_batch_add "set wireless.radio0.noscan='1'"
+
+    uci_batch_add "set wireless.radio1.country='${CFG_REGDOMAIN}'"
+    uci_batch_add "set wireless.radio1.channel='${CFG_RADIO2G_CHANNEL}'"
+    uci_batch_add "set wireless.radio1.htmode='${CFG_RADIO2G_HTMODE}'"
+    uci_batch_add "set wireless.radio1.txpower='${CFG_RADIO2G_TXPOWER}'"
+    uci_batch_add "set wireless.radio1.disabled='${CFG_RADIO2G_DISABLED}'"
+}
+
+# =============================================================================
+# RENDER: Profil ap_roaming
+# =============================================================================
+render_ap_roaming() {
+    log_step "Render: Profil ap_roaming"
+    CHANGES_WIRELESS=1
+    CHANGES_NETWORK=1
+
+    local enc="${CFG_ENC_POLICY}"
+    # Encryption: sae = WPA3-only, sae-mixed = WPA2/WPA3 transition
+    [ "${enc}" != "sae" ] && [ "${enc}" != "sae-mixed" ] && enc="sae"
+
+    # Idempotenz: alte managed sections entfernen
+    uci_delete_managed_sections "wireless"
+
+    # 5G AP
+    uci_batch_add "set wireless.wlan_ap5g=wifi-iface"
+    uci_batch_add "set wireless.wlan_ap5g.device='radio0'"
+    uci_batch_add "set wireless.wlan_ap5g.mode='ap'"
+    uci_batch_add "set wireless.wlan_ap5g.ssid='${CFG_SSID_MAIN}'"
+    uci_batch_add "set wireless.wlan_ap5g.encryption='${enc}'"
+    uci_batch_add "set wireless.wlan_ap5g.key='${CFG_PASS_MAIN}'"
+    uci_batch_add "set wireless.wlan_ap5g.network='lan'"
+    uci_batch_add "set wireless.wlan_ap5g.ieee80211w='2'"
+    uci_batch_add "set wireless.wlan_ap5g.${MANAGED_MARKER}='1'"
+
+    # SAE-specific
+    uci_batch_add "set wireless.wlan_ap5g.sae_pwe='2'"
+    uci_batch_add "set wireless.wlan_ap5g.sae_require_mfp='1'"
+
+    # 802.11r
+    if [ "${ENABLE_11R}" -eq 1 ]; then
+        log_info "802.11r (FT) aktivieren"
+        uci_batch_add "set wireless.wlan_ap5g.ieee80211r='1'"
+        uci_batch_add "set wireless.wlan_ap5g.mobility_domain='${CFG_MOBILITY_DOMAIN}'"
+        uci_batch_add "set wireless.wlan_ap5g.ft_over_ds='${CFG_FT_OVER_DS}'"
+        uci_batch_add "set wireless.wlan_ap5g.ft_psk_generate_local='1'"
+        uci_batch_add "set wireless.wlan_ap5g.reassociation_deadline='1000'"
+    fi
+
+    # 802.11k
+    if [ "${ENABLE_11K}" -eq 1 ]; then
+        log_info "802.11k (RRM) aktivieren"
+        uci_batch_add "set wireless.wlan_ap5g.ieee80211k='1'"
+        uci_batch_add "set wireless.wlan_ap5g.rrm_neighbor_report='1'"
+        uci_batch_add "set wireless.wlan_ap5g.rrm_beacon_report='1'"
+    fi
+
+    # 802.11v
+    if [ "${ENABLE_11V}" -eq 1 ]; then
+        log_info "802.11v (BTM) aktivieren"
+        uci_batch_add "set wireless.wlan_ap5g.ieee80211v='1'"
+        uci_batch_add "set wireless.wlan_ap5g.bss_transition='1'"
+        uci_batch_add "set wireless.wlan_ap5g.wnm_sleep_mode='0'"
+    fi
+
+    # 2G AP (optional, kein 11r auf 2.4G empfohlen)
+    uci_batch_add "set wireless.wlan_ap2g=wifi-iface"
+    uci_batch_add "set wireless.wlan_ap2g.device='radio1'"
+    uci_batch_add "set wireless.wlan_ap2g.mode='ap'"
+    uci_batch_add "set wireless.wlan_ap2g.ssid='${CFG_SSID_MAIN}'"
+    uci_batch_add "set wireless.wlan_ap2g.encryption='${enc}'"
+    uci_batch_add "set wireless.wlan_ap2g.key='${CFG_PASS_MAIN}'"
+    uci_batch_add "set wireless.wlan_ap2g.network='lan'"
+    uci_batch_add "set wireless.wlan_ap2g.ieee80211w='2'"
+    uci_batch_add "set wireless.wlan_ap2g.sae_pwe='2'"
+    uci_batch_add "set wireless.wlan_ap2g.${MANAGED_MARKER}='1'"
+    [ "${ENABLE_11K}" -eq 1 ] && uci_batch_add "set wireless.wlan_ap2g.ieee80211k='1'"
+    [ "${ENABLE_11V}" -eq 1 ] && uci_batch_add "set wireless.wlan_ap2g.bss_transition='1'"
+
+    # r0kh/r1kh nur wenn 11r aktiv
+    if [ "${ENABLE_11R}" -eq 1 ]; then
+        render_r0kh_r1kh "wlan_ap5g"
+    fi
+
+    render_network_lan
+    log_ok "Profil ap_roaming gerendert"
+}
+
+# =============================================================================
+# RENDER: r0kh/r1kh UCI List (802.11r Multi-AP)
+# Format hostapd: r0kh = "<nas_id> <ip> <key>", r1kh = "<r1kh_id> <addr> <key>"
+# =============================================================================
+render_r0kh_r1kh() {
+    local iface="$1"
+    local i=0 nas_id ip key r1kh_id addr
+
+    # r0kh entries
+    i=0
+    while [ $i -le 20 ]; do
+        nas_id="$(jf "${MASTER_JSON}" "$.roaming.r0kh[${i}].nas_id" 2>/dev/null)"
+        [ -z "${nas_id}" ] && break
+        ip="$(jf "${MASTER_JSON}" "$.roaming.r0kh[${i}].ip")"
+        key="$(jf "${MASTER_JSON}" "$.roaming.r0kh[${i}].key")"
+        uci_batch_add "list wireless.${iface}.r0kh='${nas_id} ${ip} ${key}'"
+        log_info "r0kh[${i}]: ${nas_id} ${ip}"
+        i=$((i + 1))
+    done
+    [ $i -eq 0 ] && log_warn "Keine r0kh-Einträge in master.json (roaming.r0kh)"
+
+    # r1kh entries
+    i=0
+    while [ $i -le 20 ]; do
+        r1kh_id="$(jf "${MASTER_JSON}" "$.roaming.r1kh[${i}].r1kh_id" 2>/dev/null)"
+        [ -z "${r1kh_id}" ] && break
+        addr="$(jf "${MASTER_JSON}" "$.roaming.r1kh[${i}].addr")"
+        key="$(jf "${MASTER_JSON}" "$.roaming.r1kh[${i}].key")"
+        uci_batch_add "list wireless.${iface}.r1kh='${r1kh_id} ${addr} ${key}'"
+        log_info "r1kh[${i}]: ${r1kh_id} ${addr}"
+        i=$((i + 1))
+    done
+    [ $i -eq 0 ] && log_warn "Keine r1kh-Einträge in master.json (roaming.r1kh)"
+}
+
+# =============================================================================
+# RENDER: Profil mesh_11s_backhaul
+# =============================================================================
+render_mesh_11s_backhaul() {
+    log_step "Render: Profil mesh_11s_backhaul"
+    CHANGES_WIRELESS=1
+    CHANGES_NETWORK=1
+
+    uci_delete_managed_sections "wireless"
+
+    # 5G Mesh Backhaul (802.11s)
+    uci_batch_add "set wireless.wlan_mesh5g=wifi-iface"
+    uci_batch_add "set wireless.wlan_mesh5g.device='radio0'"
+    uci_batch_add "set wireless.wlan_mesh5g.mode='mesh'"
+    uci_batch_add "set wireless.wlan_mesh5g.mesh_id='${CFG_SSID_MESH}'"
+    uci_batch_add "set wireless.wlan_mesh5g.mesh_fwding='1'"
+    uci_batch_add "set wireless.wlan_mesh5g.mesh_rssi_threshold='-80'"
+    uci_batch_add "set wireless.wlan_mesh5g.encryption='sae'"
+    uci_batch_add "set wireless.wlan_mesh5g.key='${CFG_PASS_MESH}'"
+    uci_batch_add "set wireless.wlan_mesh5g.network='mesh'"
+    uci_batch_add "set wireless.wlan_mesh5g.ieee80211w='2'"
+    uci_batch_add "set wireless.wlan_mesh5g.${MANAGED_MARKER}='1'"
+
+    # Optional: zusätzlicher AP auf 2G
+    uci_batch_add "set wireless.wlan_meshap2g=wifi-iface"
+    uci_batch_add "set wireless.wlan_meshap2g.device='radio1'"
+    uci_batch_add "set wireless.wlan_meshap2g.mode='ap'"
+    uci_batch_add "set wireless.wlan_meshap2g.ssid='${CFG_SSID_MAIN}'"
+    uci_batch_add "set wireless.wlan_meshap2g.encryption='${CFG_ENC_POLICY}'"
+    uci_batch_add "set wireless.wlan_meshap2g.key='${CFG_PASS_MAIN}'"
+    uci_batch_add "set wireless.wlan_meshap2g.network='lan'"
+    uci_batch_add "set wireless.wlan_meshap2g.ieee80211w='2'"
+    uci_batch_add "set wireless.wlan_meshap2g.${MANAGED_MARKER}='1'"
+
+    render_network_mesh
+    log_ok "Profil mesh_11s_backhaul gerendert"
+}
+
+# =============================================================================
+# RENDER: Profil client_backhaul
+# =============================================================================
+render_client_backhaul() {
+    log_step "Render: Profil client_backhaul"
+    CHANGES_WIRELESS=1
+    CHANGES_NETWORK=1
+
+    [ -z "${CFG_NODE_MASTER_AP}" ] && {
+        log_fail "client_backhaul benötigt master_ap_ip in master.json (Node ${NODE_ID})"
+        return 1
+    }
+
+    uci_delete_managed_sections "wireless"
+
+    # 5G STA (verbindet sich zum Master-AP)
+    uci_batch_add "set wireless.wlan_sta5g=wifi-iface"
+    uci_batch_add "set wireless.wlan_sta5g.device='radio0'"
+    uci_batch_add "set wireless.wlan_sta5g.mode='sta'"
+    uci_batch_add "set wireless.wlan_sta5g.ssid='${CFG_SSID_MAIN}'"
+    uci_batch_add "set wireless.wlan_sta5g.encryption='${CFG_ENC_POLICY}'"
+    uci_batch_add "set wireless.wlan_sta5g.key='${CFG_PASS_MAIN}'"
+    uci_batch_add "set wireless.wlan_sta5g.network='wwan'"
+    uci_batch_add "set wireless.wlan_sta5g.ieee80211w='2'"
+    [ -n "${CFG_MASTER_AP_BSSID}" ] && \
+        uci_batch_add "set wireless.wlan_sta5g.bssid='${CFG_MASTER_AP_BSSID}'"
+    uci_batch_add "set wireless.wlan_sta5g.${MANAGED_MARKER}='1'"
+
+    # Lokaler AP auf 2G
+    uci_batch_add "set wireless.wlan_localap2g=wifi-iface"
+    uci_batch_add "set wireless.wlan_localap2g.device='radio1'"
+    uci_batch_add "set wireless.wlan_localap2g.mode='ap'"
+    uci_batch_add "set wireless.wlan_localap2g.ssid='${CFG_SSID_MAIN}'"
+    uci_batch_add "set wireless.wlan_localap2g.encryption='${CFG_ENC_POLICY}'"
+    uci_batch_add "set wireless.wlan_localap2g.key='${CFG_PASS_MAIN}'"
+    uci_batch_add "set wireless.wlan_localap2g.network='lan'"
+    uci_batch_add "set wireless.wlan_localap2g.ieee80211w='2'"
+    uci_batch_add "set wireless.wlan_localap2g.${MANAGED_MARKER}='1'"
+
+    render_network_client_backhaul
+    log_ok "Profil client_backhaul gerendert"
+}
+
+# =============================================================================
+# RENDER: Profil guest_isolated
+# =============================================================================
+render_guest_isolated() {
+    log_step "Render: Profil guest_isolated"
+    CHANGES_WIRELESS=1
+    CHANGES_NETWORK=1
+    CHANGES_FIREWALL=1
+    CHANGES_DHCP=1
+
+    uci_delete_managed_sections "wireless"
+    uci_delete_managed_sections "network"
+    uci_delete_managed_sections "firewall"
+    uci_delete_managed_sections "dhcp"
+
+    # Gast-WLAN 5G
+    uci_batch_add "set wireless.wlan_guest5g=wifi-iface"
+    uci_batch_add "set wireless.wlan_guest5g.device='radio0'"
+    uci_batch_add "set wireless.wlan_guest5g.mode='ap'"
+    uci_batch_add "set wireless.wlan_guest5g.ssid='${CFG_SSID_GUEST}'"
+    uci_batch_add "set wireless.wlan_guest5g.encryption='${CFG_ENC_POLICY}'"
+    uci_batch_add "set wireless.wlan_guest5g.key='${CFG_PASS_GUEST}'"
+    uci_batch_add "set wireless.wlan_guest5g.network='guest'"
+    uci_batch_add "set wireless.wlan_guest5g.ieee80211w='2'"
+    uci_batch_add "set wireless.wlan_guest5g.isolate='1'"
+    uci_batch_add "set wireless.wlan_guest5g.${MANAGED_MARKER}='1'"
+
+    # Gast-WLAN 2G
+    uci_batch_add "set wireless.wlan_guest2g=wifi-iface"
+    uci_batch_add "set wireless.wlan_guest2g.device='radio1'"
+    uci_batch_add "set wireless.wlan_guest2g.mode='ap'"
+    uci_batch_add "set wireless.wlan_guest2g.ssid='${CFG_SSID_GUEST}'"
+    uci_batch_add "set wireless.wlan_guest2g.encryption='${CFG_ENC_POLICY}'"
+    uci_batch_add "set wireless.wlan_guest2g.key='${CFG_PASS_GUEST}'"
+    uci_batch_add "set wireless.wlan_guest2g.network='guest'"
+    uci_batch_add "set wireless.wlan_guest2g.ieee80211w='2'"
+    uci_batch_add "set wireless.wlan_guest2g.isolate='1'"
+    uci_batch_add "set wireless.wlan_guest2g.${MANAGED_MARKER}='1'"
+
+    # Gast-Bridge (DSA/VLAN)
+    local guest_ip; guest_ip="$(echo "${CFG_IP_GUEST_SUBNET}" | sed 's/\.[0-9]*\/[0-9]*/\.1/')"
+    local guest_mask="255.255.255.0"
+
+    # DSA: dedizierte Gast-Bridge
+    uci_batch_add "set network.br_guest=device"
+    uci_batch_add "set network.br_guest.type='bridge'"
+    uci_batch_add "set network.br_guest.name='br-guest'"
+    uci_batch_add "set network.br_guest.${MANAGED_MARKER}='1'"
+
+    uci_batch_add "set network.guest=interface"
+    uci_batch_add "set network.guest.device='br-guest'"
+    uci_batch_add "set network.guest.proto='static'"
+    uci_batch_add "set network.guest.ipaddr='${guest_ip}'"
+    uci_batch_add "set network.guest.netmask='${guest_mask}'"
+    uci_batch_add "set network.guest.${MANAGED_MARKER}='1'"
+
+    # Firewall: Gast-Zone
+    uci_batch_add "set firewall.zone_guest=zone"
+    uci_batch_add "set firewall.zone_guest.name='guest'"
+    uci_batch_add "set firewall.zone_guest.network='guest'"
+    uci_batch_add "set firewall.zone_guest.input='REJECT'"
+    uci_batch_add "set firewall.zone_guest.output='ACCEPT'"
+    uci_batch_add "set firewall.zone_guest.forward='REJECT'"
+    uci_batch_add "set firewall.zone_guest.${MANAGED_MARKER}='1'"
+
+    # Forwarding: guest -> wan (Internet), kein guest -> lan
+    uci_batch_add "set firewall.fwd_guest_wan=forwarding"
+    uci_batch_add "set firewall.fwd_guest_wan.src='guest'"
+    uci_batch_add "set firewall.fwd_guest_wan.dest='wan'"
+    uci_batch_add "set firewall.fwd_guest_wan.${MANAGED_MARKER}='1'"
+
+    # DHCP für Gastnetz
+    uci_batch_add "set dhcp.dhcp_guest=dhcp"
+    uci_batch_add "set dhcp.dhcp_guest.interface='guest'"
+    uci_batch_add "set dhcp.dhcp_guest.start='100'"
+    uci_batch_add "set dhcp.dhcp_guest.limit='150'"
+    uci_batch_add "set dhcp.dhcp_guest.leasetime='1h'"
+    uci_batch_add "set dhcp.dhcp_guest.${MANAGED_MARKER}='1'"
+
+    log_ok "Profil guest_isolated gerendert"
+}
+
+# =============================================================================
+# RENDER: Netzwerk-Helpers
+# =============================================================================
+render_network_lan() {
+    local lan_ip; lan_ip="$(echo "${CFG_IP_LAN_SUBNET}" | sed 's/\.[0-9]*\/[0-9]*/\.1/')"
+    # DSA: LAN-Interface auf VLAN-Sub-Device
+    uci_batch_add "set network.lan.device='br-lan.${CFG_VLAN_LAN}'"
+    uci_batch_add "set network.lan.proto='static'"
+    uci_batch_add "set network.lan.ipaddr='${lan_ip}'"
+    uci_batch_add "set network.lan.netmask='255.255.255.0'"
+    uci_batch_add "set network.lan.dns='${CFG_DNS_PRIMARY} ${CFG_DNS_SECONDARY}'"
+}
+
+# =============================================================================
+# RENDER: DSA Management VLAN Interface
+# =============================================================================
+render_mgmt_interface() {
+    [ -z "${CFG_NODE_MGMT_IP}" ] && { log_warn "mgmt_ip nicht gesetzt - kein mgmt-Interface"; return 0; }
+    log_step "Render: mgmt-Interface (DSA VLAN ${CFG_VLAN_MGMT})"
+    uci_batch_add "set network.mgmt=interface"
+    uci_batch_add "set network.mgmt.device='br-lan.${CFG_VLAN_MGMT}'"
+    uci_batch_add "set network.mgmt.proto='static'"
+    uci_batch_add "set network.mgmt.ipaddr='${CFG_NODE_MGMT_IP}'"
+    uci_batch_add "set network.mgmt.netmask='255.255.255.0'"
+    uci_batch_add "set network.mgmt.${MANAGED_MARKER}='1'"
+    CHANGES_NETWORK=1
+    log_ok "mgmt-Interface: ${CFG_NODE_MGMT_IP} auf br-lan.${CFG_VLAN_MGMT}"
+}
+
+render_network_mesh() {
+    # Mesh-Interface: MESH_PROTO=none → reines 802.11s-Bridging (LAN-Bridge)
+    # MESH_PROTO=batadv → batman-adv (erfordert kmod-batman-adv)
+    uci_batch_add "set network.mesh=interface"
+    if [ "${MESH_PROTO}" = "batadv" ]; then
+        uci_batch_add "set network.mesh.proto='batadv'"
+        uci_batch_add "set network.mesh.mesh_fwding='1'"
+    else
+        # Reines 802.11s: Mesh-Interface als Bridge-Member der LAN-Bridge
+        uci_batch_add "set network.mesh.proto='none'"
+    fi
+    uci_batch_add "set network.mesh.${MANAGED_MARKER}='1'"
+    render_network_lan
+}
+
+render_network_client_backhaul() {
+    # WAN über WLAN STA
+    uci_batch_add "set network.wwan=interface"
+    uci_batch_add "set network.wwan.proto='dhcp'"
+    uci_batch_add "set network.wwan.metric='10'"
+    uci_batch_add "set network.wwan.${MANAGED_MARKER}='1'"
+    render_network_lan
+}
+
+# =============================================================================
+# APPLY: Profile dispatchen
+# =============================================================================
+render_profile() {
+    uci_batch_init
+    render_system
+    render_radios
+
+    case "${PROFILE}" in
+        ap_roaming)        render_ap_roaming       || return 1 ;;
+        mesh_11s_backhaul) render_mesh_11s_backhaul || return 1 ;;
+        client_backhaul)   render_client_backhaul   || return 1 ;;
+        guest_isolated)    render_guest_isolated    || return 1 ;;
+    esac
+
+    # mgmt-Interface immer rendern (alle Profile)
+    render_mgmt_interface
+
+    uci_batch_add "commit wireless"
+    uci_batch_add "commit network"
+    [ "${CHANGES_FIREWALL}" -eq 1 ] && uci_batch_add "commit firewall"
+    [ "${CHANGES_DHCP}" -eq 1 ]     && uci_batch_add "commit dhcp"
+    return 0
+}
+
+apply_config() {
+    log_step "Wende UCI-Konfiguration an"
+    local cfg_list="system wireless network"
+    [ "${CHANGES_FIREWALL}" -eq 1 ] && cfg_list="${cfg_list} firewall"
+    [ "${CHANGES_DHCP}" -eq 1 ]     && cfg_list="${cfg_list} dhcp"
+
+    # Checksums vor Apply (für Änderungs-Erkennung)
+    local sum_before sum_after
+    sum_before="$(sha256sum /etc/config/wireless /etc/config/network 2>/dev/null)"
+
+    local uci_out uci_rc
+    uci_out="$(uci batch < "${UCI_BATCH_FILE}" 2>&1)"
+    uci_rc=$?
+    echo "${uci_out}" >> "${MAIN_LOG}"
+    [ -n "${uci_out}" ] && log_info "uci batch output: ${uci_out}"
+    if [ "${uci_rc}" -ne 0 ]; then
+        log_fail "uci batch fehlgeschlagen (rc=${uci_rc}): ${uci_out}"
+        return 1
+    fi
+
+    for cfg in ${cfg_list}; do
+        uci commit "${cfg}" 2>/dev/null && log_ok "commit ${cfg}" || log_warn "commit ${cfg} - keine Änderung"
+    done
+
+    sum_after="$(sha256sum /etc/config/wireless /etc/config/network 2>/dev/null)"
+
+    APPLY_TIME="$(date +%s)"
+
+    # Selective reload
+    if [ "${sum_before}" != "${sum_after}" ] || [ "${CHANGES_NETWORK}" -eq 1 ]; then
+        log_step "Reloading: network"
+        /etc/init.d/network reload 2>&1 | tee -a "${MAIN_LOG}"
+        sleep 3
+    fi
+
+    if [ "${CHANGES_WIRELESS}" -eq 1 ]; then
+        log_step "Reloading: wireless"
+        wifi reload 2>&1 | tee -a "${MAIN_LOG}"
+        sleep "${HEALTHCHECK_SLEEP}"
+    fi
+
+    if [ "${CHANGES_FIREWALL}" -eq 1 ]; then
+        log_step "Reloading: firewall"
+        /etc/init.d/firewall reload 2>&1 | tee -a "${MAIN_LOG}"
+    fi
+
+    if [ "${CHANGES_DHCP}" -eq 1 ]; then
+        log_step "Restarting: dnsmasq"
+        /etc/init.d/dnsmasq restart 2>&1 | tee -a "${MAIN_LOG}"
+    fi
+
+    log_ok "Apply abgeschlossen"
+    return 0
+}
+
+# =============================================================================
+# HEALTHCHECK
+# =============================================================================
+check_wireless_up() {
+    log_step "Healthcheck: WLAN-Interfaces via ubus"
+    local retries=0
+    local max_retries=6
+
+    while [ "${retries}" -lt "${max_retries}" ]; do
+        local status; status="$(ubus call network.wireless status 2>/dev/null)"
+        if [ -n "${status}" ]; then
+            # Prüfe erwartete Interfaces je Profil
+            case "${PROFILE}" in
+                ap_roaming)
+                    echo "${status}" | grep -q '"mode":"ap"' && {
+                        log_ok "Healthcheck: AP-Mode Interface erkannt"
+                        return 0
+                    }
+                    ;;
+                mesh_11s_backhaul)
+                    echo "${status}" | grep -q '"mode":"mesh"' && {
+                        log_ok "Healthcheck: Mesh-Interface erkannt"
+                        return 0
+                    }
+                    ;;
+                client_backhaul)
+                    echo "${status}" | grep -q '"mode":"sta"' && {
+                        log_ok "Healthcheck: STA-Interface erkannt"
+                        return 0
+                    }
+                    ;;
+                guest_isolated)
+                    echo "${status}" | grep -q "${CFG_SSID_GUEST}" && {
+                        log_ok "Healthcheck: Guest-SSID erkannt"
+                        return 0
+                    }
+                    ;;
+            esac
+        fi
+        retries=$((retries + 1))
+        log_info "Healthcheck: Warte auf WLAN... Versuch ${retries}/${max_retries}"
+        sleep 5
+    done
+
+    log_fail "Healthcheck: WLAN-Interface nach ${HEALTHCHECK_TIMEOUT}s nicht gefunden"
+    return 1
+}
+
+check_bridges_up() {
+    log_step "Healthcheck: Bridge/VLAN-Interfaces"
+    if ip link show type bridge 2>/dev/null | grep -q 'br-lan'; then
+        log_ok "Healthcheck: br-lan UP"
+    else
+        log_warn "Healthcheck: br-lan nicht gefunden"
+    fi
+
+    # Gast-Bridge (nur bei guest_isolated)
+    if [ "${PROFILE}" = "guest_isolated" ]; then
+        if ip link 2>/dev/null | grep -q 'br-guest\|guest'; then
+            log_ok "Healthcheck: Guest-Bridge UP"
+        else
+            log_fail "Healthcheck: Guest-Bridge nicht gefunden"
+            return 1
+        fi
+    fi
+    return 0
+}
+
+check_logread_errors() {
+    log_step "Healthcheck: logread auf Fatal-Errors (letzte ${LOGREAD_WINDOW}s)"
+    local errors
+    errors="$(logread 2>/dev/null | tail -200 | grep -iE '(hostapd|netifd|wpa_supplicant).*\b(fatal|error|failed|FAILED)\b' | tail -10)"
+
+    if [ -n "${errors}" ]; then
+        log_fail "Healthcheck: Fatal-Errors im Log:"
+        echo "${errors}" | while read -r line; do
+            log_fail "  ${line}"
+        done
+        return 1
+    fi
+    log_ok "Healthcheck: Keine Fatal-Errors in logread"
+    return 0
+}
+
+check_firewall_zones() {
+    [ "${PROFILE}" != "guest_isolated" ] && return 0
+    log_step "Healthcheck: Firewall-Zonen"
+    if uci show firewall 2>/dev/null | grep -q "zone_guest"; then
+        log_ok "Healthcheck: Firewall-Zone 'guest' konfiguriert"
+    else
+        log_fail "Healthcheck: Firewall-Zone 'guest' fehlt"
+        return 1
+    fi
+    return 0
+}
+
+run_healthcheck() {
+    local fail=0
+    check_wireless_up  || fail=1
+    check_bridges_up   || fail=1
+    check_logread_errors && true  # Warnung, kein hard fail
+    check_firewall_zones || fail=1
+
+    if [ "${fail}" -ne 0 ]; then
+        log_fail "Healthcheck fehlgeschlagen - leite Rollback ein"
+        return 1
+    fi
+    log_ok "Alle Healthchecks bestanden"
+    return 0
+}
+
+# =============================================================================
+# ROLLBACK
+# =============================================================================
+find_latest_backup() {
+    # Neuestes Backup für diese Node
+    local latest
+    latest="$(ls -1d "${BACKUP_BASE}"/*_node${NODE_ID}_* 2>/dev/null | sort | tail -1)"
+    echo "${latest}"
+}
+
+do_rollback() {
+    local backup_dir="$1"
+
+    if [ -z "${backup_dir}" ]; then
+        backup_dir="$(find_latest_backup)"
+    fi
+
+    if [ -z "${backup_dir}" ] || [ ! -d "${backup_dir}" ]; then
+        log_fail "Rollback: Kein Backup gefunden für Node ${NODE_ID}"
+        log_fail "Gesuchter Pfad: ${BACKUP_BASE}/*_node${NODE_ID}_*"
+        return 1
+    fi
+
+    log_step "Rollback: Wiederherstelle aus ${backup_dir}"
+
+    for cfg in network wireless firewall dhcp; do
+        if [ -f "${backup_dir}/${cfg}" ]; then
+            cp "${backup_dir}/${cfg}" "/etc/config/${cfg}" && \
+                log_ok "Rollback: /etc/config/${cfg} wiederhergestellt" || {
+                log_fail "Rollback: Konnte /etc/config/${cfg} nicht wiederherstellen"
+                return 1
+            }
+        fi
+    done
+
+    log_step "Rollback: Reload nach Wiederherstellung"
+    /etc/init.d/network reload 2>&1 | tee -a "${MAIN_LOG}"
+    sleep 3
+    wifi reload 2>&1 | tee -a "${MAIN_LOG}"
+    sleep "${HEALTHCHECK_SLEEP}"
+    /etc/init.d/firewall reload 2>&1 | tee -a "${MAIN_LOG}"
+    /etc/init.d/dnsmasq restart 2>&1 | tee -a "${MAIN_LOG}"
+
+    # Minimaler Healthcheck nach Rollback
+    local status; status="$(ubus call network.wireless status 2>/dev/null)"
+    if [ -n "${status}" ]; then
+        log_ok "Rollback: WLAN-Subsystem antwortet"
+    else
+        log_warn "Rollback: WLAN-Subsystem antwortet nicht (kann transient sein)"
+    fi
+
+    log_ok "Rollback abgeschlossen: ${backup_dir}"
+    return 0
+}
+
+# =============================================================================
+# UCI DIFF (für Logging bei Fehler)
+# =============================================================================
+log_uci_diff() {
+    log_step "UCI-Diff nach Fehler:"
+    for cfg in wireless network firewall dhcp; do
+        echo "--- uci show ${cfg} ---" >> "${STEP_LOG}"
+        uci show "${cfg}" >> "${STEP_LOG}" 2>&1
+    done
+    log_info "UCI-State in: ${STEP_LOG}"
+}
+
+# =============================================================================
+# CLEANUP
+# =============================================================================
+cleanup() {
+    rm -f "${UCI_BATCH_FILE}" 2>/dev/null
+}
+trap cleanup EXIT INT TERM
+
+# =============================================================================
+# MAIN
+# =============================================================================
+main() {
+    log_init
+    parse_args "$@"
+
+    echo "========================================"
+    echo " provision v${VERSION}"
+    echo " Node: ${NODE_ID}  Profil: ${PROFILE:-rollback}"
+    echo " $(date)"
+    echo "========================================"
+
+    log_info "START: node=${NODE_ID} profile=${PROFILE} apply=${DO_APPLY} dry_run=${DRY_RUN} 11r=${ENABLE_11R} 11k=${ENABLE_11K} 11v=${ENABLE_11V}"
+
+    # --- ROLLBACK MODE ---
+    if [ "${DO_ROLLBACK}" -eq 1 ]; then
+        log_step "Modus: ROLLBACK"
+        load_master_json
+        do_rollback "" || exit ${EXIT_ROLLBACK}
+        log_ok "Rollback erfolgreich"
+        exit ${EXIT_OK}
+    fi
+
+    # --- LOAD CONFIG ---
+    load_master_json
+
+    # --- VALIDATE ONLY ---
+    if [ "${VALIDATE_ONLY}" -eq 1 ]; then
+        run_validations || exit ${EXIT_VALIDATION}
+        echo "  Validierung OK (--validate-only)"
+        exit ${EXIT_OK}
+    fi
+
+    # --- PRE-VALIDATE ---
+    run_validations || exit ${EXIT_VALIDATION}
+
+    # --- DRY RUN ---
+    if [ "${DRY_RUN}" -eq 1 ]; then
+        log_step "Modus: DRY-RUN"
+        render_profile || exit ${EXIT_VALIDATION}
+        echo "  Dry-Run abgeschlossen. Kein Commit."
+        exit ${EXIT_OK}
+    fi
+
+    # --- APPLY ---
+    if [ "${DO_APPLY}" -eq 1 ]; then
+        # Backup erstellen
+        create_backup || {
+            log_fail "Backup fehlgeschlagen - Apply abgebrochen"
+            exit ${EXIT_APPLY}
+        }
+
+        # Render + Apply
+        render_profile || {
+            log_fail "Render fehlgeschlagen"
+            exit ${EXIT_APPLY}
+        }
+
+        apply_config || {
+            log_fail "Apply fehlgeschlagen (rc=${EXIT_APPLY})"
+            log_uci_diff
+            log_step "Auto-Rollback..."
+            do_rollback "${BACKUP_DIR}" || {
+                log_fail "Auto-Rollback fehlgeschlagen!"
+                exit ${EXIT_ROLLBACK}
+            }
+            exit ${EXIT_APPLY}
+        }
+
+        # Healthcheck
+        run_healthcheck || {
+            log_fail "Healthcheck fehlgeschlagen (rc=${EXIT_HEALTHCHECK})"
+            log_uci_diff
+            log_step "Auto-Rollback wegen Healthcheck-Fehler..."
+            do_rollback "${BACKUP_DIR}" || {
+                log_fail "Auto-Rollback fehlgeschlagen!"
+                exit ${EXIT_ROLLBACK}
+            }
+            exit ${EXIT_HEALTHCHECK}
+        }
+
+        log_ok "DONE: node=${NODE_ID} profile=${PROFILE} - Provisioning erfolgreich"
+        echo "========================================"
+        echo " Provisioning ERFOLGREICH"
+        echo " Log: ${STEP_LOG}"
+        echo "========================================"
+        exit ${EXIT_OK}
+    fi
+}
+
+main "$@"

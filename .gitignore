@@ -1,0 +1,10 @@
+# Claude internal
+.claude/
+
+# Temp files
+*.txt
+*.tmp
+
+# Logs and backups (only on device)
+logs/
+backups/
